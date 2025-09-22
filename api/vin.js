@@ -1,11 +1,14 @@
 // api/vin.js
-// Decodes a VIN using NHTSA by default. Optionally adds a short AI summary.
-// GET  /api/vin?vin=...   or   POST { vin: "..." }
+// Decodes a VIN using NHTSA by default. Optionally enriches missing fields with AI,
+// and (optionally) adds a short AI summary.
+// GET /api/vin?vin=...   or   POST { vin: "..." }
 
 const PROVIDER = process.env.VIN_DECODER_PROVIDER || 'nhtsa';
 const AI_SUMMARY_ENABLED = String(process.env.AI_SUMMARY_ENABLED || 'false').toLowerCase() === 'true';
+const AI_ENRICH_ENABLED = String(process.env.AI_ENRICH_ENABLED || 'true').toLowerCase() === 'true';
 
 const DEFAULT_TIMEOUT_MS = Number(process.env.HTTP_TIMEOUT_MS || 6000);
+const aiCache = new Map(); // local cache of enrich results during dev
 
 function withTimeout(promise, ms = DEFAULT_TIMEOUT_MS, label = 'request') {
   return Promise.race([
@@ -54,6 +57,8 @@ async function decodeWithNHTSA(vin) {
     engineHP: row.EngineHP ? Number(row.EngineHP) : undefined,
     manufacturer: row.ManufacturerName || undefined,
     plantCountry: row.PlantCountry || undefined,
+    msrp: undefined,
+    source: 'nhtsa',
   };
 
   const parts = [mapped.year, mapped.make, mapped.model, mapped.trim].filter(Boolean);
@@ -63,69 +68,4 @@ async function decodeWithNHTSA(vin) {
 
 async function decodeWithCustom(vin) {
   const base = process.env.VIN_DECODER_URL;
-  const key = process.env.VIN_DECODER_KEY;
-  if (!base) throw new Error('VIN_DECODER_URL not set');
-  const url = `${base.replace(/\/$/, '')}/decode?vin=${encodeURIComponent(vin)}`;
-  const res = await withTimeout(fetch(url, { headers: key ? { Authorization: `Bearer ${key}` } : {} }), DEFAULT_TIMEOUT_MS, 'Custom decoder');
-  if (!res.ok) throw new Error(`Custom decoder error: ${res.status} ${res.statusText}`);
-  return await res.json();
-}
-
-async function aiSummary(vehicle) {
-  if (!AI_SUMMARY_ENABLED) return null;
-  const apiKey = process.env.OPENAI_API_KEY;
-  const model = process.env.OPENAI_MODEL || 'gpt-4o-mini';
-  const baseUrl = process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1';
-  if (!apiKey) return null;
-
-  const facts = pick(vehicle, [
-    'year','make','model','trim','bodyClass','doors','driveType',
-    'transmission','fuelType','engineCylinders','displacementL','engineHP'
-  ]);
-
-  const prompt = [
-    'Write a concise, neutral 2–3 sentence summary of this vehicle.',
-    'Highlight trim/engine/drivetrain/body style if available. Avoid marketing.',
-    `Vehicle JSON: ${JSON.stringify(facts)}`
-  ].join(' ');
-
-  try {
-    const res = await withTimeout(fetch(`${baseUrl}/chat/completions`, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model,
-        messages: [{ role: 'user', content: prompt }],
-        temperature: 0.2,
-        max_tokens: 120,
-      }),
-    }), DEFAULT_TIMEOUT_MS, 'AI summary');
-
-    if (!res.ok) return null;
-    const data = await res.json();
-    return data?.choices?.[0]?.message?.content?.trim() || null;
-  } catch {
-    // If AI fails or times out, just return null; do not block VIN decode.
-    return null;
-  }
-}
-
-module.exports = async (req, res) => {
-  try {
-    const input = req.method === 'GET'
-      ? (req.query || Object.fromEntries(new URL(req.url, 'http://local').searchParams))
-      : await readBody(req);
-
-    const vin = (input.vin || '').toString().trim().toUpperCase();
-    if (!vin || vin.length !== 17) {
-      return res.status(400).json({ ok: false, error: 'VIN must be 17 characters', vin });
-    }
-
-    const decoded = await (PROVIDER === 'nhtsa' ? decodeWithNHTSA(vin) : decodeWithCustom(vin));
-    const summary = await aiSummary(decoded); // null if disabled/fails
-
-    return res.status(200).json({ ok: true, data: { ...decoded, summary } });
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: String(e?.message || e) });
-  }
-};
+  const key
