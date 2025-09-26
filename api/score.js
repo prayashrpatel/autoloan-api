@@ -1,85 +1,71 @@
-// api/score.js
-const DEFAULT_TIMEOUT_MS = Number(process.env.HTTP_TIMEOUT_MS || 6000);
+// api/score.js  — default export (ESM)
+const clamp = (x, lo, hi) => Math.min(Math.max(x, lo), hi);
+const sigmoid = (z) => 1 / (1 + Math.exp(-z));
 
-async function readBody(req) {
-  if (req.body && typeof req.body === "object") return req.body;
-  let raw = "";
-  for await (const chunk of req) raw += chunk;
-  try { return raw ? JSON.parse(raw) : {}; } catch { return {}; }
-}
-const num = (n, d = 0) => (Number.isFinite(Number(n)) ? Number(n) : d);
-const clamp = (x, a, b) => Math.min(b, Math.max(a, x));
-
+/**
+ * Expect JSON body:
+ * {
+ *   financedAmount, apr, termMonths,
+ *   features: { ltv, dti },   // if you already compute in FE, send them too
+ *   borrower: { monthlyIncome, housingCost, otherDebt }
+ * }
+ */
 export default async function handler(req, res) {
   try {
     if (req.method !== "POST") {
       res.writeHead(405, { "Content-Type": "application/json" });
-      return res.end(JSON.stringify({ ok: false, error: "Method not allowed" }));
+      return res.end(JSON.stringify({ error: "Method not allowed" }));
     }
 
-    const body = await readBody(req);
-    const cfg = body?.cfg || {};
-    const borrower = body?.borrower || {};
+    // Read JSON body
+    const chunks = [];
+    for await (const c of req) chunks.push(c);
+    const body = JSON.parse(Buffer.concat(chunks).toString() || "{}");
 
-    const price = num(cfg.price);
-    const down = num(cfg.down);
-    const feesUpfront = num(cfg?.fees?.upfront);
-    const feesFinanced = num(cfg?.fees?.financed);
-    const extrasUpfront = num(cfg?.extras?.upfront);
-    const extrasFinanced = num(cfg?.extras?.financed);
-    const tradeIn = num(cfg.tradeIn);
-    const tradeInPayoff = num(cfg.tradeInPayoff);
-    const apr = num(cfg.apr);
-    const termMonths = num(cfg.termMonths);
-    const taxRate = num(cfg.taxRate);
-    const taxRule = cfg.taxRule === "price_full" ? "price_full" : "price_minus_tradein";
+    const {
+      financedAmount = 0,
+      apr = 0,
+      termMonths = 60,
+      features = {},
+      borrower = {},
+    } = body || {};
 
-    const monthlyIncome = num(borrower.monthlyIncome);
-    const housingCost = num(borrower.housingCost);
-    const otherDebt = num(borrower.otherDebt);
+    // Derive (fallbacks if FE didn’t send)
+    const ltv = Number(features.ltv ?? 0); // 0..2 typically
+    const dti = Number(features.dti ?? 0); // 0..2 typically
+    const income = Number(borrower.monthlyIncome ?? 0);
 
-    const taxableBase = taxRule === "price_full" ? price : Math.max(0, price - tradeIn);
-    const salesTax = taxableBase * (taxRate / 100);
+    // Simple engineered features
+    const ltvPct = clamp(ltv, 0, 2);          // keep in sane range
+    const dtiPct = clamp(dti, 0, 2);
+    const term   = clamp(Number(termMonths || 60), 12, 96);
+    const amount = clamp(Number(financedAmount || 0) / 1000, 0, 200);
+    const rate   = clamp(Number(apr || 0), 0, 30);
+    const incK   = clamp(income / 1000, 0, 50);
 
-    const financedAmount = Math.max(
-      0,
-      price + feesUpfront + feesFinanced + extrasUpfront + extrasFinanced + salesTax
-        - down - tradeIn + tradeInPayoff
-    );
+    // Logistic regression (made-up but realistic-ish coefficients)
+    // logit(PD) = b0 + b1*ltv + b2*dti + b3*term + b4*amount + b5*rate + b6*incK
+    const b0 = -3.2;
+    const b1 =  2.1;   // LTV drives risk up
+    const b2 =  2.4;   // DTI drives risk up
+    const b3 =  0.01;  // longer term slightly riskier
+    const b4 =  0.005; // larger loans slightly riskier
+    const b5 =  0.06;  // higher APR correlates with higher risk
+    const b6 = -0.03;  // higher income reduces risk
 
-    const ltv = price > 0 ? financedAmount / price : 0;
+    const z = b0 + b1*ltvPct + b2*dtiPct + b3*term + b4*amount + b5*rate + b6*incK;
+    const pd = clamp(sigmoid(z), 0.001, 0.999);
 
-    const r = apr > 0 ? (apr / 100) / 12 : 0;
-    const pmt =
-      r > 0 && termMonths > 0
-        ? financedAmount * (r / (1 - Math.pow(1 + r, -termMonths)))
-        : termMonths > 0
-        ? financedAmount / termMonths
-        : 0;
-
-    const dti = monthlyIncome > 0 ? (housingCost + otherDebt + pmt) / monthlyIncome : 0;
-
-    const violations = [];
-    if (ltv > 1.0) violations.push({ code: "MAX_LTV", message: "LTV exceeds 100.0%" });
-    if (dti > 0.5) violations.push({ code: "MAX_DTI", message: "DTI 50.0% limit exceeded" });
-
-    const approved = violations.length === 0;
-
-    let pd = 0.02 + 0.6 * clamp(ltv - 0.8, 0, 1) + 0.6 * clamp(dti - 0.3, 0, 1);
-    pd = clamp(pd, 0.01, 0.95);
-    const confidence = 0.7;
+    // A very rough “confidence”: better when inputs aren’t missing and within ranges
+    let conf = 0.85;
+    if (!Number.isFinite(ltv) || !Number.isFinite(dti) || !income) conf -= 0.25;
+    if (term < 12 || term > 96) conf -= 0.05;
 
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({
-      ok: true,
-      data: {
-        rules: { approved, violations },
-        risk: { pd, confidence },
-        features: { ltv, dti },
-      },
-    }));
-  } catch (e) {
+    res.end(JSON.stringify({ pd, confidence: clamp(conf, 0, 1) }));
+  } catch (err) {
+    console.error("[score] error:", err);
     res.writeHead(500, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ ok: false, error: String(e?.message || e) }));
+    res.end(JSON.stringify({ error: "Internal Server Error" }));
   }
 }
