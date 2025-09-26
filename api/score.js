@@ -1,65 +1,85 @@
 // api/score.js
+const DEFAULT_TIMEOUT_MS = Number(process.env.HTTP_TIMEOUT_MS || 6000);
 
 async function readBody(req) {
-  // If framework already parsed:
-  if (req.body && typeof req.body === 'object') return req.body;
-  if (typeof req.body === 'string') {
-    try { return JSON.parse(req.body); } catch { return {}; }
-  }
-
-  // Otherwise, read the stream:
-  let raw = '';
+  if (req.body && typeof req.body === "object") return req.body;
+  let raw = "";
   for await (const chunk of req) raw += chunk;
-  if (!raw) return {};
-
-  const ct = String(req.headers['content-type'] || '').toLowerCase();
-  if (ct.includes('application/json')) {
-    try { return JSON.parse(raw); } catch { return {}; }
-  }
-  if (ct.includes('application/x-www-form-urlencoded')) {
-    return Object.fromEntries(new URLSearchParams(raw));
-  }
-  return {};
+  try { return raw ? JSON.parse(raw) : {}; } catch { return {}; }
 }
+const num = (n, d = 0) => (Number.isFinite(Number(n)) ? Number(n) : d);
+const clamp = (x, a, b) => Math.min(b, Math.max(a, x));
 
-module.exports = async (req, res) => {
+export default async function handler(req, res) {
   try {
-    // GET → use query; POST → parse body
-    const input = req.method === 'GET'
-      ? (req.query || Object.fromEntries(new URL(req.url, 'http://local').searchParams))
-      : await readBody(req);
-
-    const num = (v) => (v === null || v === undefined || v === '' ? null : Number(v));
-    const ltv = num(input.ltv);
-    const dti = num(input.dti);
-    const apr = num(input.apr);
-    const termMonths = num(input.termMonths);
-    const income = num(input.income);
-
-    const missing = [];
-    if (!(ltv >= 0)) missing.push('ltv');
-    if (!(dti >= 0)) missing.push('dti');
-    if (!(apr >= 0)) missing.push('apr');
-    if (!(termMonths > 0)) missing.push('termMonths');
-    if (!(income > 0)) missing.push('income');
-
-    if (missing.length) {
-      return res.status(400).json({ error: `Missing/invalid: ${missing.join(', ')}`, received: input });
+    if (req.method !== "POST") {
+      res.writeHead(405, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ ok: false, error: "Method not allowed" }));
     }
 
-    // Simple illustrative PD calc (tune as you like)
-    const base =
-      0.02 +
-      Math.max(0, ltv - 0.80) * 0.25 +
-      Math.max(0, dti - 0.35) * 0.30 +
-      Math.max(0, apr - 0.06) * 4.0;
+    const body = await readBody(req);
+    const cfg = body?.cfg || {};
+    const borrower = body?.borrower || {};
 
-    const pd = Math.min(0.35, Math.max(0.005, +base.toFixed(4)));
-    const confidence = 0.70;
-    const decision = (ltv <= 1.10 && dti <= 0.45 && pd < 0.20) ? 'APPROVED' : 'DECLINED';
+    const price = num(cfg.price);
+    const down = num(cfg.down);
+    const feesUpfront = num(cfg?.fees?.upfront);
+    const feesFinanced = num(cfg?.fees?.financed);
+    const extrasUpfront = num(cfg?.extras?.upfront);
+    const extrasFinanced = num(cfg?.extras?.financed);
+    const tradeIn = num(cfg.tradeIn);
+    const tradeInPayoff = num(cfg.tradeInPayoff);
+    const apr = num(cfg.apr);
+    const termMonths = num(cfg.termMonths);
+    const taxRate = num(cfg.taxRate);
+    const taxRule = cfg.taxRule === "price_full" ? "price_full" : "price_minus_tradein";
 
-    return res.status(200).json({ decision, pd, confidence });
+    const monthlyIncome = num(borrower.monthlyIncome);
+    const housingCost = num(borrower.housingCost);
+    const otherDebt = num(borrower.otherDebt);
+
+    const taxableBase = taxRule === "price_full" ? price : Math.max(0, price - tradeIn);
+    const salesTax = taxableBase * (taxRate / 100);
+
+    const financedAmount = Math.max(
+      0,
+      price + feesUpfront + feesFinanced + extrasUpfront + extrasFinanced + salesTax
+        - down - tradeIn + tradeInPayoff
+    );
+
+    const ltv = price > 0 ? financedAmount / price : 0;
+
+    const r = apr > 0 ? (apr / 100) / 12 : 0;
+    const pmt =
+      r > 0 && termMonths > 0
+        ? financedAmount * (r / (1 - Math.pow(1 + r, -termMonths)))
+        : termMonths > 0
+        ? financedAmount / termMonths
+        : 0;
+
+    const dti = monthlyIncome > 0 ? (housingCost + otherDebt + pmt) / monthlyIncome : 0;
+
+    const violations = [];
+    if (ltv > 1.0) violations.push({ code: "MAX_LTV", message: "LTV exceeds 100.0%" });
+    if (dti > 0.5) violations.push({ code: "MAX_DTI", message: "DTI 50.0% limit exceeded" });
+
+    const approved = violations.length === 0;
+
+    let pd = 0.02 + 0.6 * clamp(ltv - 0.8, 0, 1) + 0.6 * clamp(dti - 0.3, 0, 1);
+    pd = clamp(pd, 0.01, 0.95);
+    const confidence = 0.7;
+
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({
+      ok: true,
+      data: {
+        rules: { approved, violations },
+        risk: { pd, confidence },
+        features: { ltv, dti },
+      },
+    }));
   } catch (e) {
-    return res.status(500).json({ error: String(e?.message || e) });
+    res.writeHead(500, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ok: false, error: String(e?.message || e) }));
   }
-};
+}
