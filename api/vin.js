@@ -18,49 +18,35 @@ const client = OPENAI_KEY ? new OpenAI({ apiKey: OPENAI_KEY }) : null;
 
 /* ------------------------------- Utilities ------------------------------ */
 const clean = (s) => (s && typeof s === "string" ? s.trim() || null : null);
-const getNum = (x) => {
-  const n = Number(x);
-  return Number.isFinite(n) ? n : null;
-};
-const first = (row, ...keys) => {
-  for (const k of keys) {
-    const v = row?.[k];
-    if (v != null && String(v).trim() !== "") return v;
-  }
-  return null;
-};
+const getNum = (x) => { const n = Number(x); return Number.isFinite(n) ? n : null; };
+const first = (row, ...keys) => { for (const k of keys) { const v = row?.[k]; if (v != null && String(v).trim() !== "") return v; } return null; };
 
-/** Decode model year from VIN 10th character, using plausible cycle. */
 function decodeYearFromVin(vin) {
   if (!vin || vin.length < 10) return null;
   const code = vin[9].toUpperCase();
   const baseMap = {
     A: 1980, B: 1981, C: 1982, D: 1983, E: 1984, F: 1985, G: 1986, H: 1987,
     J: 1988, K: 1989, L: 1990, M: 1991, N: 1992, P: 1993, R: 1994, S: 1995,
-    T: 1996, V: 1997, W: 1998, X: 1999, Y: 2000,
-    "1": 2001, "2": 2002, "3": 2003, "4": 2004, "5": 2005,
-    "6": 2006, "7": 2007, "8": 2008, "9": 2009,
+    T: 1996, V: 1997, W: 1998, X: 1999, Y: 2000, "1": 2001, "2": 2002, "3": 2003,
+    "4": 2004, "5": 2005, "6": 2006, "7": 2007, "8": 2008, "9": 2009,
   };
   if (!(code in baseMap)) return null;
-
   const base = baseMap[code];
   const currentYear = new Date().getFullYear();
-  const maxYear = currentYear + 1; // early next-MY allowance
+  const maxYear = currentYear + 1;
   const candidates = [base, base + 30, base + 60].filter((y) => y >= 1980 && y <= 2069);
-
-  let chosen = null;
-  for (const y of candidates) if (y <= maxYear) chosen = y;
+  let chosen = null; for (const y of candidates) if (y <= maxYear) chosen = y;
   return chosen ?? null;
 }
 
-/** Normalize NHTSA "Body Class" to a simple label. */
+/* ----------------------- Normalizers & helpers -------------------------- */
 function normalizeBodyClass(raw) {
   if (!raw || typeof raw !== "string") return null;
   const s = raw.toLowerCase();
   if (s.includes("hatchback")) return "Hatchback";
   if (s.includes("coupe")) return "Coupe";
   if (s.includes("convertible") || s.includes("cabriolet") || s.includes("roadster")) return "Convertible";
-  if (s.includes("wagon")) return "Wagon";
+  if (s.includes("wagon") || s.includes("estate") || s.includes("avant")) return "Wagon";
   if (s.includes("pickup")) return "Pickup";
   if (s.includes("minivan") || s.includes("mini-van")) return "Minivan";
   if (s.includes("van")) return "Van";
@@ -68,8 +54,6 @@ function normalizeBodyClass(raw) {
   if (s.includes("sedan") || s.includes("saloon") || s.includes("limousine")) return "Sedan";
   return null; // too vague
 }
-
-/** Normalize drive strings to codes. */
 function normalizeDrive(raw) {
   if (!raw || typeof raw !== "string") return null;
   const s = raw.toLowerCase();
@@ -77,106 +61,77 @@ function normalizeDrive(raw) {
   if (s.includes("front")) return "FWD";
   if (s.includes("all") || s.includes("awd") || s.includes("4 wheel")) return "AWD";
   if (s.includes("4wd") || s.includes("four-wheel")) return "4WD";
-  if (["rwd", "fwd", "awd", "4wd"].includes(s)) return s.toUpperCase();
+  if (["rwd","fwd","awd","4wd"].includes(s)) return s.toUpperCase();
+  return null;
+}
+const isConvertibleLike = (text) => /\b(convertible|cabrio|cabriolet|roadster|spyder)\b/i.test((text || "").toLowerCase());
+function keywordBody(text) {
+  const t = (text || "").toLowerCase();
+  if (/\bhatch\b|\bhatchback\b/.test(t)) return "Hatchback";
+  if (/\bcoup[eé]\b|\b2-?door\b/.test(t)) return "Coupe";
+  if (/\bwagon|estate|avant\b/.test(t)) return "Wagon";
+  if (/\bconvertible\b|\bcabrio\b|\bcabriolet\b|\broadster\b|\bspyder\b/.test(t)) return "Convertible";
+  if (/\bsuv\b|\bcrossover\b/.test(t)) return "SUV";
+  if (/\bsedan\b|\bsaloon\b|\blimousine\b/.test(t)) return "Sedan";
+  if (/\bminivan\b/.test(t)) return "Minivan";
+  if (/\bvan\b/.test(t)) return "Van";
+  if (/\bpickup\b|\btruck\b/.test(t)) return "Pickup";
   return null;
 }
 
-/** Body guess from model/trim keywords. */
-function guessBodyFromNames({ model, trim }) {
-  const text = [model, trim].filter(Boolean).join(" ").toLowerCase();
-  if (!text) return null;
-  if (/\bhatch\b|\bhatchback\b/.test(text)) return "Hatchback";
-  if (/\bcoupe\b/.test(text)) return "Coupe";
-  if (/\bwagon\b/.test(text)) return "Wagon";
-  if (/\bconvertible\b|\bcabrio\b|\bcabriolet\b|\broadster\b/.test(text)) return "Convertible";
-  if (/\bsuv\b|\bcrossover\b/.test(text)) return "SUV";
-  if (/\bsedan\b/.test(text)) return "Sedan";
-  if (/\bminivan\b/.test(text)) return "Minivan";
-  if (/\bvan\b/.test(text)) return "Van";
-  if (/\bpickup\b|\btruck\b/.test(text)) return "Pickup";
-  return null;
-}
-const isConvertibleLike = (text) =>
-  /\b(convertible|cabrio|cabriolet|roadster|spyder)\b/i.test((text || "").toLowerCase());
+/* ---------------------- Known-model dictionary (small) ------------------ */
+const KNOWN_MODELS = [
+  // style is optional (marketing); body is the physical class
+  { rx: /mercedes.*\bcls\b/i, body: "Sedan", style: "4-Door Coupe" },
+  { rx: /audi\s(a7|s7|rs7)\b/i, body: "Sedan", style: "Sportback" },
+  { rx: /bmw.*\bgran coupe\b/i, body: "Sedan", style: "Gran Coupe" },
+  { rx: /\barteon\b/i, body: "Sedan", style: "Fastback" },
+  { rx: /\bstinger\b/i, body: "Sedan", style: "Fastback" },
+  { rx: /\bsienna\b|odyssey\b/i, body: "Minivan" },
+  { rx: /\boutback\b/i, body: "Wagon" },
+  // E-Class Coupe (C238) & other coupes often mislabeled as sedan
+  { rx: /mercedes.*\be(-|\s)?class\b.*\b(e|e450|amg)\b.*\b(coupe)\b/i, body: "Coupe" },
+];
 
-/** Strong heuristic body fixer (runs before + after AI). */
-function deriveBodyFromHeuristics(data) {
-  if (data.body && !/sedan|unknown/i.test(data.body)) return data.body;
-  const name = [data.model, data.trim].filter(Boolean).join(" ");
-  const doors = data.doors ?? null;
+/* ----------------------- Universal body classifier ---------------------- */
+function classifyBodyPyramid({ nhtsaBody, doors, make, model, trim }) {
+  const votes = new Map(); // body -> score
+  const add = (label, pts) => { if (!label) return; votes.set(label, (votes.get(label) || 0) + pts); };
+  const name = [make, model, trim].filter(Boolean).join(" ");
 
-  if (isConvertibleLike(name)) return "Convertible";
-  if (doors === 2) return "Coupe";
-  if (/\b(hatch|hatchback)\b/i.test(name)) return "Hatchback";
-  if (/\bwagon\b/i.test(name)) return "Wagon";
-  if (/\bminivan\b/i.test(name)) return "Minivan";
-  if (/\bvan\b/i.test(name)) return "Van";
-  if (/\b(pickup|truck)\b/i.test(name)) return "Pickup";
-  if (/\b(suv|crossover)\b/i.test(name)) return "SUV";
-  if (doors === 4 && (!data.body || /sedan/i.test(data.body))) return "Sedan";
-  return data.body || null;
-}
+  // 1) NHTSA precise
+  const mapped = normalizeBodyClass(nhtsaBody);
+  if (mapped) add(mapped, 3);
 
-/** Brand/trim keywords for drive. */
-function deriveDriveFromNames(data) {
-  const s = [data.make, data.model, data.trim].filter(Boolean).join(" ").toLowerCase();
-  if (/\b(4matic|quattro|xdrive|4motion|4wd|awd)\b/i.test(s)) return "AWD";
-  if (/\bsdrive\b/i.test(s)) return "RWD";
-  return data.drive || null;
-}
+  // 2) hard cues
+  if (isConvertibleLike(name)) add("Convertible", 3);
+  if (Number(doors) === 2 && !isConvertibleLike(name)) add("Coupe", 3);
 
-/** Shallow-fill only missing keys. */
-function fillMissing(base, patch) {
-  const out = { ...base };
-  for (const k of Object.keys(patch || {})) {
-    if (out[k] == null && patch[k] != null) out[k] = patch[k];
-  }
-  return out;
+  // 3) keywords
+  add(keywordBody(name), 2);
+
+  // 4) dictionary
+  for (const row of KNOWN_MODELS) { if (row.rx.test(name)) { add(row.body, 3); } }
+
+  // winner
+  let best = null, bestScore = -1;
+  for (const [label, score] of votes.entries()) { if (score > bestScore) { best = label; bestScore = score; } }
+
+  // guards
+  if (Number(doors) === 2 && best !== "Convertible") best = "Coupe";
+  if (isConvertibleLike(name)) best = "Convertible";
+
+  // style via dictionary (optional, doesn’t affect body)
+  let style = null;
+  for (const row of KNOWN_MODELS) { if (row.rx.test(name) && row.style) { style = row.style; break; } }
+
+  return { body: best || null, style };
 }
 
-/** Merge base + AI with strong guards (2 doors ⇒ Coupe). */
-function reconcileVehicleFields(baseData, aiPatch) {
-  const out = { ...baseData };
-
-  // BODY: heuristics first
-  const heurBody = deriveBodyFromHeuristics(out);
-  if (heurBody) out.body = heurBody;
-
-  // AI may refine body
-  if (aiPatch?.body) out.body = aiPatch.body;
-
-  // FINAL guard: 2 doors ⇒ Coupe (unless convertible)
-  if (Number(out.doors) === 2 && !isConvertibleLike(out.body)) {
-    out.body = "Coupe";
-  }
-
-  // DRIVE: brand/trim inference
-  const nameDrive = deriveDriveFromNames(out);
-  if (nameDrive) out.drive = nameDrive;
-
-  // AI may refine drive
-  if (aiPatch?.drive) out.drive = aiPatch.drive;
-
-  // Normalize drive code
-  if (out.drive) {
-    const d = String(out.drive).toUpperCase();
-    if (["AWD", "RWD", "FWD", "4WD"].includes(d)) out.drive = d;
-  }
-
-  return out;
-}
-
-/* --------------------------- NHTSA -> VinInfo --------------------------- */
+/* ---------------------------- NHTSA → VinInfo --------------------------- */
 function fromNhtsa(row, vinValue) {
-  const body = normalizeBodyClass(clean(first(row, "Body Class", "BodyClass"))) || null;
-
-  const rawDrive = first(
-    row,
-    "Drive Type",
-    "Drive Type - Primary",
-    "DriveType",
-    "DriveTypePrimary"
-  );
+  const nhtsaBodyRaw = clean(first(row, "Body Class", "BodyClass"));
+  const rawDrive = first(row, "Drive Type", "Drive Type - Primary", "DriveType", "DriveTypePrimary");
   const drive = normalizeDrive(rawDrive) || clean(rawDrive);
 
   const yearApi = getNum(first(row, "Model Year", "ModelYear"));
@@ -189,41 +144,41 @@ function fromNhtsa(row, vinValue) {
     make: clean(first(row, "Make")),
     model: clean(first(row, "Model")),
     trim: clean(first(row, "Trim", "Series")),
-    body,
+
+    // keep raw; final body/style decided later by classifier
+    _nhtsaBody: nhtsaBodyRaw,
+    body: normalizeBodyClass(nhtsaBodyRaw) || null,
+    style: null,
+
     doors: getNum(first(row, "Doors", "DoorCount")),
-    drive, // normalized value
+    drive,
     transmission: clean(first(row, "Transmission Style", "TransmissionDescriptor", "Transmission")),
     fuel: clean(first(row, "Fuel Type - Primary", "Fuel Type Primary", "FuelTypePrimary")),
-    cylinders: getNum(first(row, "Engine Number of Cylinders", "EngineCylinders", "Cylinders")),
+    cylinders: getNum(first(row, "Engine Number of Cylinders", "EngineNumberofCylinders", "Cylinders")),
     displacement: getNum(first(row, "Displacement (L)", "Engine Displacement (L)", "EngineDisplacementL", "DisplacementL")),
     engineHp: getNum(first(row, "Engine HP", "EngineHP")),
+
     msrp: null,
     summary: null,
     title: null,
   };
 }
 
-/* ----------------------------- AI enrichment ---------------------------- */
+/* ------------------------------- AI enrich ------------------------------ */
 async function enrichWithAI(base) {
-  if (!ENRICH || !client) {
-    console.log("[VIN] Skipping AI enrichment (disabled or no key).");
-    return null;
-  }
+  if (!ENRICH || !client) return null;
 
   const prompt = [
     "You are enriching decoded VIN data.",
     "Return ONLY a valid JSON object (no prose) with missing fields you can confidently infer.",
     "Allowed keys: body, drive, transmission, fuel, cylinders, displacement, engineHp, msrp, summary (<=40 words).",
+    "Body must be one of: [\"sedan\",\"coupe\",\"convertible\",\"hatchback\",\"wagon\",\"suv\",\"minivan\",\"pickup\",\"van\"].",
     "Never contradict the provided data. If unsure, omit the key.",
     "",
     "Known data:",
     JSON.stringify({
-      year: base.year,
-      make: base.make,
-      model: base.model,
-      trim: base.trim,
-      body: base.body,
-      doors: base.doors,
+      year: base.year, make: base.make, model: base.model, trim: base.trim,
+      body: base.body, doors: base.doors
     }),
   ].join("\n");
 
@@ -234,45 +189,29 @@ async function enrichWithAI(base) {
       temperature: AI_TEMPERATURE,
       max_tokens: AI_MAX_OUTPUT_TOKENS,
     });
-
     const text = r.choices?.[0]?.message?.content || "";
-    // Extract the first JSON object from any formatting
     const match = text.match(/\{[\s\S]*\}/);
     if (!match) return null;
 
     const patch = JSON.parse(match[0]);
     if (!DO_SUM && "summary" in patch) delete patch.summary;
 
-    const allowed = [
-      "body",
-      "drive",
-      "transmission",
-      "fuel",
-      "cylinders",
-      "displacement",
-      "engineHp",
-      "msrp",
-      "summary",
-    ];
-    const filtered = {};
-    for (const k of allowed) if (patch[k] != null) filtered[k] = patch[k];
-    return filtered;
+    const allowed = ["body","drive","transmission","fuel","cylinders","displacement","engineHp","msrp","summary"];
+    const out = {};
+    for (const k of allowed) if (patch[k] != null) out[k] = patch[k];
+    return out;
   } catch (err) {
     console.error("[VIN] AI enrichment error:", err);
     return null;
   }
 }
 
-/* ----------------------------- Fetch with timeout ----------------------- */
+/* ----------------------------- Fetch w/ timeout ------------------------- */
 async function fetchWithTimeout(url, ms) {
   const controller = new AbortController();
   const t = setTimeout(() => controller.abort(), ms);
-  try {
-    const resp = await fetch(url, { signal: controller.signal });
-    return resp;
-  } finally {
-    clearTimeout(t);
-  }
+  try { return await fetch(url, { signal: controller.signal }); }
+  finally { clearTimeout(t); }
 }
 
 /* -------------------------------- Handler ------------------------------- */
@@ -286,13 +225,12 @@ async function handler(req, res) {
 
     const vinParam = String(url.searchParams.get("vin") || "").trim().toUpperCase();
     const forceFresh = url.searchParams.get("fresh") === "1";
-
     if (!/^[A-HJ-NPR-Z0-9]{17}$/.test(vinParam)) {
       res.writeHead(400, { "Content-Type": "application/json" });
       return res.end(JSON.stringify({ error: "VIN must be 17 characters (no I/O/Q)." }));
     }
 
-    // Cache (unless ?fresh=1)
+    // cache unless fresh=1
     if (!forceFresh) {
       const cached = vinCache.get(vinParam);
       if (cached && Date.now() - cached.when < VIN_CACHE_TTL_MS) {
@@ -302,17 +240,18 @@ async function handler(req, res) {
       }
     }
 
-    // NHTSA decode
-    const nhtsaUrl = `https://vpic.nhtsa.dot.gov/api/vehicles/decodevinvaluesextended/${vinParam}?format=json`;
-    const r = await fetchWithTimeout(nhtsaUrl, HTTP_TIMEOUT_MS);
+    // NHTSA
+    const r = await fetchWithTimeout(
+      `https://vpic.nhtsa.dot.gov/api/vehicles/decodevinvaluesextended/${vinParam}?format=json`,
+      HTTP_TIMEOUT_MS
+    );
     if (!r.ok) {
       res.writeHead(502, { "Content-Type": "application/json" });
       return res.end(JSON.stringify({ error: `NHTSA error ${r.status}` }));
     }
 
     const j = await r.json();
-    const row = Array.isArray(j?.Results) &&
-      (j.Results.find((x) => x.Make || x.Model || x["Model Year"]) || j.Results[0]);
+    const row = Array.isArray(j?.Results) && (j.Results.find(x => x.Make || x.Model || x["Model Year"]) || j.Results[0]);
     if (!row) {
       res.writeHead(404, { "Content-Type": "application/json" });
       return res.end(JSON.stringify({ error: "VIN not found" }));
@@ -320,47 +259,77 @@ async function handler(req, res) {
 
     let data = fromNhtsa(row, vinParam);
 
-    // Title fallback
+    // title
     if (!data.title) {
       const parts = [data.year, data.make, data.model, data.trim].filter(Boolean);
       data.title = parts.join(" ").trim() || null;
     }
 
-    // Extra heuristic if body still unknown
-    if (!data.body) {
-      const guess = guessBodyFromNames({ model: data.model, trim: data.trim });
-      if (guess) data.body = guess;
-    }
+    // ---------- BODY: universal classifier (NHTSA + heuristics + dict) ----------
+    const cls = classifyBodyPyramid({
+      nhtsaBody: data._nhtsaBody, doors: data.doors,
+      make: data.make, model: data.model, trim: data.trim
+    });
+    if (cls.body) data.body = cls.body;
+    if (cls.style) data.style = cls.style;
 
+    // ---------- AI enrichment (only if key gaps) ----------
     const meta = { ai: { enabled: ENRICH, attempted: false, ok: false, model: MODEL } };
     const missing =
-      !data.body ||
-      !data.drive ||
-      !data.transmission ||
-      !data.fuel ||
-      !data.cylinders ||
-      !data.displacement ||
-      !data.engineHp ||
-      data.msrp == null ||
-      (DO_SUM && !data.summary);
+      !data.body || !data.drive || !data.transmission || !data.fuel ||
+      !data.cylinders || !data.displacement || !data.engineHp ||
+      data.msrp == null || (DO_SUM && !data.summary);
 
     let aiPatch = null;
     if (ENRICH && missing) {
       meta.ai.attempted = true;
       aiPatch = await enrichWithAI(data);
       if (aiPatch) {
-        // Fill non-body/drive fields first
+        // fill non-body/drive first; body/drive get final say below
         const { body, drive, ...rest } = aiPatch;
-        data = fillMissing(data, rest);
+        for (const k of Object.keys(rest)) if (data[k] == null && rest[k] != null) data[k] = rest[k];
         meta.ai.ok = true;
       }
     }
 
-    // Always reconcile to finalize body/drive
-    data = reconcileVehicleFields(data, aiPatch);
+    // ---------- DRIVE finalize ----------
+    // 1) explicit model keywords
+    const nameStr = `${data.make || ""} ${data.model || ""} ${data.trim || ""}`.toLowerCase();
+    const hasAwdKeyword = /\b(4matic|quattro|xdrive|4motion|awd|all[\s-]?wheel|4wd)\b/i.test(nameStr);
+    if (!data.drive && hasAwdKeyword) data.drive = "AWD";
 
+    // 2) brand/body defaults: coupes default RWD unless AWD keyword
+    if ((data.body || "").toLowerCase() === "coupe" && !hasAwdKeyword) {
+      if (/mercedes/.test(nameStr) || /bmw/.test(nameStr)) data.drive = "RWD";
+    }
+
+    // 3) AI override last (if provided)
+    if (aiPatch?.drive) data.drive = String(aiPatch.drive).toUpperCase();
+    if (data.drive) {
+      const d = data.drive.toUpperCase();
+      if (["AWD", "RWD", "FWD", "4WD"].includes(d)) data.drive = d;
+    }
+
+    // ---------- Cylinders sanity / correction ----------
+    // If AI provided, allow fix when base missing or implausible vs displacement & model
+    if (aiPatch?.cylinders != null) {
+      const aiCyl = Number(aiPatch.cylinders);
+      const baseCyl = Number(data.cylinders ?? 0);
+      const disp = Number(data.displacement ?? 0);
+
+      const likelyE450I6 =
+        /mercedes/.test(nameStr) && /\be[-\s]?450\b/i.test(nameStr) && disp >= 2.9 && disp <= 3.1;
+
+      // more general rule: 2.8–3.2L turbo sixes (BMW B58, Mercedes M256, etc.)
+      const looksLikeModernThreeLiter = disp >= 2.8 && disp <= 3.2 && aiCyl === 6;
+
+      if (!baseCyl || baseCyl === 4 || likelyE450I6 || looksLikeModernThreeLiter) {
+        data.cylinders = aiCyl;
+      }
+    }
+
+    // --------- Cache & respond ----------
     const payload = { data, meta };
-    // Cache
     try { vinCache.set(vinParam, { when: Date.now(), payload }); } catch {}
 
     res.writeHead(200, { "Content-Type": "application/json" });
