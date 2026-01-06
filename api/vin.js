@@ -138,12 +138,62 @@ function fromNhtsa(row, vinValue) {
   const vinYear = decodeYearFromVin(vinValue || clean(row.VIN));
   const year = yearApi ?? vinYear ?? null;
 
+  const make = clean(first(row, "Make"));
+  const rawModel = clean(first(row, "Model"));
+  const rawTrim = clean(first(row, "Trim"));
+  const rawSeries = clean(first(row, "Series"));
+
+  // ---- smart model/trim mapping ----
+  let model = rawModel;
+  let trim = rawTrim || rawSeries;
+
+  // BMW: NHTSA often puts variant in Model and the family in Series.
+  // We want: model="5-Series" trim="540i"  |  model="X3" trim="M40i"  | model="8-Series" trim="M8"
+  if ((make || "").toLowerCase() === "bmw") {
+    const rm = (rawModel || "").trim();
+    const rs = (rawSeries || "").trim();
+
+    // detect family like: "3-Series", "5-Series", "X3", "X5", "Z4", "i4"
+    const looksLikeSeriesFamily = /(series|^x\d$|^z\d$|^i\d$)/i.test(rs);
+
+    // detect BMW variant tokens:
+    // - numeric: 540i, 330i, 840i, 750e, etc.
+    // - M variants: M340i, M550i, M8, M2, M3, M4, etc.
+    // - M-performance: M40i, M50i, M60i, M35i, etc.
+    const looksLikeVariant =
+      /^(\d{3}[a-z]{0,2}|\d{3}e|m\d{1,3}[a-z]{0,2}|m(35i|40i|50i|60i)|m\d{2})\b/i.test(rm);
+
+    // Case 1: series family exists and model looks like variant -> swap
+    // ex: Series="5-Series", Model="540i"
+    if (looksLikeSeriesFamily && looksLikeVariant) {
+      model = rs;
+      trim = rm;
+    }
+
+    // Case 2: Model includes both family and variant -> split into model/trim
+    // ex: Model="X3 M40i" (Series might be missing or just "X3")
+    // We prefer model="X3", trim="M40i"
+    const split = rm.match(/\b(x\d|z\d|i\d)\b\s*(m\d{1,3}[a-z]{0,2}|m(35i|40i|50i|60i)|\d{3}[a-z]{0,2}|\d{3}e)\b/i);
+    if (split) {
+      const family = split[1].toUpperCase(); // X3
+      const variant = split[2].toUpperCase(); // M40I / 540I / etc.
+      model = family;
+      trim = variant.replace(/I$/, "i").replace(/D$/, "d"); // tiny casing cleanup
+    }
+
+    // Case 3: fallback: if Series exists but model is variant and we didn't swap above for some reason
+    if (rs && looksLikeVariant && model === rm) {
+      model = rs;
+      trim = rm;
+    }
+  }
+
   return {
     vin: vinValue || clean(row.VIN),
     year,
-    make: clean(first(row, "Make")),
-    model: clean(first(row, "Model")),
-    trim: clean(first(row, "Trim", "Series")),
+    make,
+    model,
+    trim,
 
     // keep raw; final body/style decided later by classifier
     _nhtsaBody: nhtsaBodyRaw,
