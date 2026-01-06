@@ -3,13 +3,16 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
-  "engines": { "node": ">=18" },
+  "engines": {
+    "node": ">=18"
+  },
   "scripts": {
     "dev": "node -r dotenv/config server.js",
     "key": "node -r dotenv/config checkKey.js"
   },
   "dependencies": {
     "dotenv": "^16.4.5",
+    "node-fetch": "^3.3.2",
     "openai": "^5.23.0"
   },
   "devDependencies": {
